@@ -1,0 +1,335 @@
+-- LIMPIEZA PREVIA
+
+DROP TRIGGER IF EXISTS trg_actualizar_coste_total ON contiene;
+DROP FUNCTION IF EXISTS recalcular_coste_total_pedido();
+
+DROP TABLE IF EXISTS asignado CASCADE;
+DROP TABLE IF EXISTS contiene CASCADE;
+DROP TABLE IF EXISTS almacena CASCADE;
+DROP TABLE IF EXISTS pedido CASCADE;
+DROP TABLE IF EXISTS bonificacion CASCADE;
+DROP TABLE IF EXISTS cliente_tajinaste_plus CASCADE;
+DROP TABLE IF EXISTS zona CASCADE;
+DROP TABLE IF EXISTS empleado CASCADE;
+DROP TABLE IF EXISTS cliente CASCADE;
+DROP TABLE IF EXISTS puesto CASCADE;
+DROP TABLE IF EXISTS producto CASCADE;
+DROP TABLE IF EXISTS vivero CASCADE;
+
+-- ENTIDADES FUERTES
+
+-- VIVERO
+CREATE TABLE vivero (
+    id_vivero SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    latitud NUMERIC(8,6) NOT NULL CHECK (latitud BETWEEN -90 AND 90),
+    longitud NUMERIC(9,6) NOT NULL CHECK (longitud BETWEEN -180 AND 180)
+);
+
+-- PRODUCTO
+CREATE TABLE producto (
+    id_producto SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    descripcion TEXT,
+    precio_base NUMERIC(10,2) NOT NULL CHECK (precio_base >= 0)
+);
+
+-- PUESTO
+CREATE TABLE puesto (
+    id_puesto SERIAL PRIMARY KEY,
+    nombre_puesto VARCHAR(100) NOT NULL UNIQUE,
+    descripcion TEXT
+);
+
+-- CLIENTE (Supertipo)
+CREATE TABLE cliente (
+    id_cliente SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL,
+    email VARCHAR(150) NOT NULL UNIQUE,
+    telefono VARCHAR(20)
+);
+
+-- EMPLEADO
+CREATE TABLE empleado (
+    id_empleado SERIAL PRIMARY KEY,
+    dni VARCHAR(12) NOT NULL UNIQUE,
+    nombre VARCHAR(50) NOT NULL,
+    apellidos VARCHAR(100) NOT NULL,
+    telefono VARCHAR(20)
+);
+
+
+-- ENTIDADES DEBILES
+
+-- ZONA depende de vivero
+CREATE TABLE zona (
+    id_zona SERIAL PRIMARY KEY,
+    id_vivero INT NOT NULL,
+    nombre VARCHAR(100) NOT NULL,
+    latitud NUMERIC(8,6) NOT NULL CHECK (latitud BETWEEN -90 AND 90),
+    longitud NUMERIC(9,6) NOT NULL CHECK (longitud BETWEEN -180 AND 180),
+
+    CONSTRAINT fk_zona_vivero FOREIGN KEY (id_vivero) 
+        REFERENCES vivero(id_vivero) ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT uq_vivero_zona UNIQUE (id_vivero, nombre)
+);
+
+-- CLIENTE_TAJINASTE_PLUS depende de cliente
+CREATE TABLE cliente_tajinaste_plus (
+    id_cliente INT PRIMARY KEY,
+    fecha_ingreso DATE NOT NULL DEFAULT CURRENT_DATE,
+
+    CONSTRAINT fk_plus_cliente FOREIGN KEY (id_cliente) 
+        REFERENCES cliente(id_cliente) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- PEDIDO depende de cliente y de empleado
+CREATE TABLE pedido (
+    id_pedido SERIAL PRIMARY KEY,
+    fecha TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    coste_total NUMERIC(8,2) DEFAULT 0.00 CHECK (coste_total >= 0),
+    id_cliente INT NOT NULL,
+    id_empleado INT NOT NULL,
+
+    CONSTRAINT fk_pedido_cliente FOREIGN KEY (id_cliente) 
+        REFERENCES cliente(id_cliente) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_pedido_empleado FOREIGN KEY (id_empleado) 
+        REFERENCES empleado(id_empleado) ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+-- BONIFICACION depende de cliente_tajinaste_plus
+CREATE TABLE bonificacion (
+    id_bonificacion SERIAL PRIMARY KEY,
+    id_cliente INT NOT NULL,
+    fecha_concesion DATE NOT NULL DEFAULT CURRENT_DATE,
+    monto NUMERIC(10,2) NOT NULL CHECK (monto > 0),
+    descripcion VARCHAR(200),
+
+    CONSTRAINT fk_bonificacion_cliente FOREIGN KEY (id_cliente)
+        REFERENCES cliente_tajinaste_plus(id_cliente) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+
+-- RELACIONES
+
+-- ALMACENA
+CREATE TABLE almacena (
+    id_zona INT NOT NULL,
+    id_producto INT NOT NULL,
+    cantidad INT NOT NULL CHECK (cantidad >= 0),
+    PRIMARY KEY (id_zona, id_producto),
+
+    CONSTRAINT fk_almacena_zona FOREIGN KEY (id_zona) 
+        REFERENCES zona(id_zona) ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_almacena_producto FOREIGN KEY (id_producto) 
+        REFERENCES producto(id_producto) ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+-- CONTIENE
+CREATE TABLE contiene (
+    id_pedido INT NOT NULL,
+    id_producto INT NOT NULL,
+    cantidad INT NOT NULL CHECK (cantidad > 0),
+    precio_unitario NUMERIC(10,2) NOT NULL CHECK (precio_unitario >= 0),
+    PRIMARY KEY (id_pedido, id_producto),
+
+    CONSTRAINT fk_contiene_pedido FOREIGN KEY (id_pedido) 
+        REFERENCES pedido(id_pedido) ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_contiene_producto FOREIGN KEY (id_producto) 
+        REFERENCES producto(id_producto) ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+-- ASIGNADO
+CREATE TABLE asignado (
+    id_empleado INT NOT NULL,
+    id_zona INT NOT NULL,
+    id_puesto INT NOT NULL,
+    fecha_inicio DATE NOT NULL,
+    fecha_fin DATE,
+    PRIMARY KEY (id_empleado, id_zona, id_puesto, fecha_inicio),
+
+    CONSTRAINT chk_fechas_asignacion CHECK (fecha_fin IS NULL OR fecha_fin >= fecha_inicio),
+    CONSTRAINT fk_asig_empleado FOREIGN KEY (id_empleado) 
+        REFERENCES empleado(id_empleado) ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_asig_zona FOREIGN KEY (id_zona) 
+        REFERENCES zona(id_zona) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_asig_puesto FOREIGN KEY (id_puesto) 
+        REFERENCES puesto(id_puesto) ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+
+
+-- Cálculo de atributos derivados
+-- 1. Función que calcula el total sumando las líneas del pedido en la tabla 'contiene'
+CREATE OR REPLACE FUNCTION recalcular_coste_total_pedido()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE pedido
+    SET coste_total = COALESCE((
+        SELECT SUM(cantidad * precio_unitario)
+        FROM contiene
+        WHERE id_pedido = COALESCE(NEW.id_pedido, OLD.id_pedido)
+    ), 0.00)
+    WHERE id_pedido = COALESCE(NEW.id_pedido, OLD.id_pedido);
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 2. Trigger que se activa automáticamente al cambiar datos en 'contiene'
+CREATE TRIGGER trg_actualizar_coste_total
+AFTER INSERT OR UPDATE OR DELETE ON contiene
+FOR EACH ROW
+EXECUTE FUNCTION recalcular_coste_total_pedido();
+
+-- INSERCION DE DATOS
+
+-- VIVERO
+INSERT INTO vivero (nombre, latitud, longitud) VALUES
+('Vivero Tajinaste Anaga', 28.520000, -16.200000),
+('Vivero Tajinaste Sur', 28.050000, -16.730000),
+('Vivero Central Orotava', 28.390000, -16.520000),
+('Vivero Gran Canaria Norte', 28.130000, -15.440000),
+('Vivero Lanzarote Volcan', 28.960000, -13.550000);
+
+-- PRODUCTO
+INSERT INTO producto (nombre, descripcion, precio_base) VALUES
+('Rosal Rojo', 'Rosal de pitimini floracion primaveral', 12.50),
+('Sustrato Universal 50L', 'Sustrato enriquecido con perlita', 8.95),
+('Maceta Ceramica 30cm', 'Maceta artesanal de barro cocido', 15.00),
+('Tijeras de Podar Prof', 'Tijeras de podar de acero inoxidable', 24.99),
+('Palmeral Canario', 'Planton de Phoenix canariensis', 45.00);
+
+-- PUESTO
+INSERT INTO puesto (nombre_puesto, descripcion) VALUES
+('Encargado de Almacen', 'Gestion de inventario y entradas/salidas'),
+('Jardinero Especialista', 'Cuidado y mantenimiento de plantas'),
+('Atencion al Cliente', 'Atencion en mostrador y gestion de pedidos'),
+('Tecnico Agronomo', 'Supervision de plagas y salud vegetal'),
+('Repartidor', 'Logistica y entrega de pedidos a domicilio');
+
+-- CLIENTE
+INSERT INTO cliente (nombre, email, telefono) VALUES
+('Juan Perez Gomez', 'juan.perez@email.com', '600111222'),
+('Maria Rodriguez', 'maria.rodriguez@email.com', '600333444'),
+('Carlos Santana', 'carlos.santana@email.com', '600555666'),
+('Ana Belen Darias', 'ana.darias@email.com', '600777888'),
+('Empresa Jardines SL', 'contacto@jardinessl.com', '922123456');
+
+-- EMPLEADO
+INSERT INTO empleado (dni, nombre, apellidos, telefono) VALUES
+('12345678A', 'Laura', 'Garcia Hernandez', '611111111'),
+('23456789B', 'Pedro', 'Martin Luis', '622222222'),
+('34567890C', 'Sofia', 'Alonso Perez', '633333333'),
+('45678901D', 'Diego', 'Torres Morales', '644444444'),
+('56789012E', 'Elena', 'Benitez Castro', '655555555');
+
+-- ZONA
+INSERT INTO zona (id_vivero, nombre, latitud, longitud) VALUES
+(1, 'Zona Exterior Plantas', 28.520100, -16.200100),
+(1, 'Invernadero A', 28.520200, -16.200200),
+(2, 'Zona Herramientas', 28.050100, -16.730100),
+(3, 'Exposicion arboles', 28.390100, -16.520100),
+(4, 'Almacen Central', 28.130100, -15.440100);
+
+-- CLIENTE_TAJINASTE_PLUS tipo de cliente
+-- Solo los clientes 1, 2 y 5 son parte del programa Plus
+INSERT INTO cliente_tajinaste_plus (id_cliente, fecha_ingreso) VALUES
+(1, '2023-01-15'),
+(2, '2023-05-20'),
+(5, '2024-01-10');
+
+-- BONIFICACION
+INSERT INTO bonificacion (id_cliente, fecha_concesion, monto, descripcion) VALUES
+(1, '2023-06-01', 10.00, 'Bonificacion de bienvenida'),
+(1, '2023-12-20', 15.00, 'Regalo de Navidad'),
+(2, '2023-06-01', 10.00, 'Bonificacion de bienvenida'),
+(5, '2024-01-10', 20.00, 'Bonificacion cliente corporativo'),
+(5, '2024-02-14', 5.00, 'Campaña San Valentin');
+
+-- PEDIDO - EL COSTE LO CALCULA EL TRIGGER
+INSERT INTO pedido (fecha, id_cliente, id_empleado) VALUES
+('2024-02-01 10:30:00', 1, 3), -- Pedido de Cliente Plus #1
+('2024-02-02 11:15:00', 2, 3), -- Pedido de Cliente Plus #2
+('2024-02-03 16:45:00', 3, 3), -- Pedido de Cliente Normal #3
+('2024-02-04 09:00:00', 4, 3), -- Pedido de Cliente Normal #4
+('2024-02-05 12:20:00', 5, 3); -- Pedido de Cliente Plus corporativo #5
+
+-- ALMACENA
+INSERT INTO almacena (id_zona, id_producto, cantidad) VALUES
+(1, 1, 50), -- 50 rosales en Zona Exterior
+(1, 5, 10), -- 10 palmeras en Zona Exterior
+(2, 2, 100),-- 100 sacos de sustrato en Invernadero A
+(3, 4, 25), -- 25 tijeras en Zona Herramientas
+(5, 3, 40); -- 40 macetas en Almacen Central
+
+-- CONTIENE
+-- AQUI VA SALTANDO EL TRIGGER Y CALCULANDO EL COSTE TOTAL DE CADA PEDIDO
+INSERT INTO contiene (id_pedido, id_producto, cantidad, precio_unitario) VALUES
+(1, 1, 2, 12.50), -- Pedido 1: 2 rosales = 25.00 €
+(1, 2, 1, 8.95),  -- Pedido 1: 1 sustrato = 8.95 € (Total Pedido 1: 33.95 €)
+(2, 3, 3, 15.00), -- Pedido 2: 3 macetas = 45.00 €
+(3, 5, 1, 45.00), -- Pedido 3: 1 palmera = 45.00 €
+(4, 4, 2, 24.99); -- Pedido 4: 2 tijeras = 49.98 €
+
+-- ASIGNADO (historico para los empleados)
+INSERT INTO asignado (id_empleado, id_zona, id_puesto, fecha_inicio, fecha_fin) VALUES
+(1, 1, 2, '2023-01-01', '2023-12-31'), -- Registro historico
+(1, 2, 4, '2024-01-01', NULL),         -- Asignacion actual
+(2, 3, 1, '2023-06-01', NULL),         -- Asignacion actual
+(3, 1, 3, '2022-03-15', NULL),         -- Asignacion actual
+(4, 5, 1, '2023-09-01', NULL);         -- Asignacion actual
+
+
+
+-- COMPROBACION DEL TRIGGER (ver coste_total calculado)
+SELECT id_pedido, fecha, coste_total FROM pedido;
+
+
+-- EJEMPLOS DE OPERACIONES DELETE
+
+-- ON DELETE CASCADE
+-- Al borrar el Vivero #5, se deben borrar automaticamente sus Zonas asociadas
+-- y las filas de stock en 'almacena' correspondientes a esas zonas.
+DELETE FROM vivero WHERE id_vivero = 5;
+
+
+-- DEMOSTRACION DE ON DELETE RESTRICT
+-- Intentar borrar el Producto #1 dara un ERROR bloqueante porque esta presente en la tabla CONTIENE
+-- Para probar se descomenta y dará error
+-- DELETE FROM producto WHERE id_producto = 1;
+
+
+-- BORRADO DE LINEA DE PEDIDO Y RECALCULO AUTOMATICO POR EL TRIGGER
+DELETE FROM contiene WHERE id_pedido = 1 AND id_producto = 2;
+
+-- Verificacion tras el borrado (el coste_total del pedido 1 pasa de 33.95 € a 25.00 €)
+SELECT id_pedido, coste_total FROM pedido WHERE id_pedido = 1;
+
+
+-- SELECT * DE CADA TABLA
+
+SELECT * FROM vivero ORDER BY id_vivero;
+
+SELECT * FROM zona ORDER BY id_zona;
+
+SELECT * FROM producto ORDER BY id_producto;
+
+SELECT * FROM puesto ORDER BY id_puesto;
+
+SELECT * FROM cliente ORDER BY id_cliente;
+
+SELECT * FROM cliente_tajinaste_plus ORDER BY id_cliente;
+
+SELECT * FROM bonificacion ORDER BY id_bonificacion;
+
+SELECT * FROM empleado ORDER BY id_empleado;
+
+SELECT * FROM pedido ORDER BY id_pedido;
+
+SELECT * FROM almacena ORDER BY id_zona, id_producto;
+
+SELECT * FROM contiene ORDER BY id_pedido, id_producto;
+
+SELECT * FROM asignado ORDER BY id_empleado, id_zona, id_puesto, fecha_inicio;
+
